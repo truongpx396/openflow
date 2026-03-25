@@ -1,0 +1,469 @@
+# yaml-language-server: $schema=../schemas/openflow-v1.0.0.schema.json
+# ──────────────────────────────────────────────────────────────────────
+# Report Excel Export & Upload Workflow
+# ──────────────────────────────────────────────────────────────────────
+# OpenFlow YAML DSL v1.0.0 — Example Workflow
+#
+# Demonstrates a document-generation pipeline that:
+#   1. Clones a spreadsheet template
+#   2. Populates header/footer ranges + inserts detail rows
+#   3. Conditionally highlights flagged cells
+#   4. Downloads and uploads the finished file
+#   5. Handles a secondary trigger for artifact uploads
+#
+# Key features showcased:
+#   - profiles (multi-environment config)
+#   - switch (environment routing)
+#   - document step type (Excel operations)
+#   - for_each with concurrency: 1 (sequential writes)
+#   - noop merge point with merge_strategy
+#   - execution_mode: once
+#   - multipart/form-data upload
+#   - conditional step execution
+#   - two independent trigger pipelines
+# ──────────────────────────────────────────────────────────────────────
+
+openflow: "1.0.0"
+
+metadata:
+  name: report-excel-export
+  version: "1.0.0"
+  description: >
+    Generates a structured Excel report from incoming data,
+    populates template cells, inserts line-item rows, highlights
+    low-confidence fields, and uploads the result to cloud storage.
+    Supports DEV, UAT, and PROD via profiles.
+  labels:
+    team: integrations
+    domain: reporting
+  annotations:
+    owner: integration-team
+
+# ─── Profiles ────────────────────────────────────────────────────────
+profiles:
+  dev:
+    variables:
+      folder_destination_id: "folder-dev-001"
+      file_template_id: "template-dev-001"
+      upload_service_url: "https://dev.api.example.com/upload"
+      folder_service_url: "https://dev.api.example.com/folders"
+      clone_service_url: "https://dev.api.example.com/clone"
+    secrets:
+      excel_oauth: excel-dev-credentials
+      drive_oauth: drive-dev-credentials
+  uat:
+    variables:
+      folder_destination_id: "folder-uat-001"
+      file_template_id: "template-uat-001"
+      upload_service_url: "https://uat.api.example.com/upload"
+      folder_service_url: "https://uat.api.example.com/folders"
+      clone_service_url: "https://uat.api.example.com/clone"
+    secrets:
+      excel_oauth: excel-uat-credentials
+      drive_oauth: drive-uat-credentials
+  prod:
+    variables:
+      folder_destination_id: "folder-prod-001"
+      file_template_id: "template-prod-001"
+      upload_service_url: "https://api.example.com/upload"
+      folder_service_url: "https://api.example.com/folders"
+      clone_service_url: "https://api.example.com/clone"
+    secrets:
+      excel_oauth: excel-prod-credentials
+      drive_oauth: drive-prod-credentials
+
+# ─── Triggers ────────────────────────────────────────────────────────
+triggers:
+  - type: webhook
+    id: generate-report
+    config:
+      method: POST
+      path: /api/reports/generate
+      response_mode: deferred
+      description: >
+        Receives report data and triggers Excel generation.
+        Profile is selected from trigger.body.env.
+
+  - type: webhook
+    id: upload-attachment
+    config:
+      method: POST
+      path: /api/reports/upload-attachment
+      response_mode: deferred
+      description: >
+        Receives supplementary PDF/document files for upload
+        alongside the generated report.
+
+# ─── Variables (defaults — overridden per profile) ───────────────────
+variables:
+  output_folder: "/Reports"
+
+# ─── Secrets ─────────────────────────────────────────────────────────
+secrets:
+  - id: excel-dev-credentials
+    provider: vault
+    path: integrations/excel-dev
+  - id: excel-uat-credentials
+    provider: vault
+    path: integrations/excel-uat
+  - id: drive-dev-credentials
+    provider: vault
+    path: integrations/drive-dev
+  - id: drive-uat-credentials
+    provider: vault
+    path: integrations/drive-uat
+  - id: excel-prod-credentials
+    provider: vault
+    path: integrations/excel-prod
+  - id: drive-prod-credentials
+    provider: vault
+    path: integrations/drive-prod
+
+# ═════════════════════════════════════════════════════════════════════
+# Steps — Report Generation Pipeline (trigger: generate-report)
+# ═════════════════════════════════════════════════════════════════════
+steps:
+  # ── 1. Route by environment ────────────────────────────────────────
+  - id: select-profile
+    name: "Select environment profile"
+    type: switch
+    trigger_ref: generate-report
+    config:
+      value: "${{ trigger.body.env | upper }}"
+      cases:
+        - match: "DEV"
+          then: create-folder
+        - match: "UAT"
+          then: create-folder
+        - match: "PROD"
+          then: create-folder
+      default: create-folder
+    description: >
+      Routes to the shared pipeline; the active profile provides
+      environment-specific variables and secrets.
+
+  # ── 2. Create output folder ───────────────────────────────────────
+  - id: create-folder
+    name: "Create or get output folder"
+    type: http
+    depends_on: [select-profile]
+    config:
+      method: POST
+      url: "${{ variables.folder_service_url }}"
+      headers:
+        Content-Type: application/json
+      body:
+        action: create
+        folder_name: "${{ trigger.body.report_id }}"
+        parent_path: "${{ variables.output_folder }}"
+      timeout: 30s
+      response_format: json
+    retry:
+      max_attempts: 3
+      delay: 2s
+      backoff: exponential
+
+  # ── 3. Clone spreadsheet template ─────────────────────────────────
+  - id: clone-template
+    name: "Clone report template"
+    type: http
+    depends_on: [create-folder]
+    config:
+      method: POST
+      url: "${{ variables.clone_service_url }}"
+      headers:
+        Content-Type: application/json
+      body:
+        action: clone
+        file_name: "Report_${{ trigger.body.report_id }}.xlsx"
+        source_file_id: "${{ variables.file_template_id }}"
+        destination_folder_id: "${{ variables.folder_destination_id }}"
+      timeout: 30s
+      response_format: json
+
+  # ── 4. Transform input data for Excel layout ──────────────────────
+  - id: prepare-data
+    name: "Map input data to spreadsheet layout"
+    type: script
+    depends_on: [clone-template]
+    config:
+      language: javascript
+      code: |
+        const body = trigger.body;
+
+        // Map fields to header rows (two rows of metadata)
+        const headerMatrix = [
+          [body.report_id, body.client_name, body.report_date,
+           body.period_start, body.period_end],
+          [body.department, body.currency, body.prepared_by,
+           body.approved_by, body.notes || ""]
+        ];
+
+        // Map summary totals to footer row
+        const footerMatrix = [
+          [body.subtotal, body.tax_amount, body.discount_amount,
+           body.grand_total, body.status || "DRAFT"]
+        ];
+
+        // Map line items for table insertion
+        const lineItems = (body.line_items || []).map(item => ({
+          description: item.description,
+          category: item.category,
+          quantity: item.quantity,
+          unit: item.unit,
+          unit_price: item.unit_price,
+          amount: item.amount,
+          tax_code: item.tax_code,
+          cost_center: item.cost_center
+        }));
+
+        // Flag low-confidence OCR fields for highlighting
+        const flaggedCells = (body.confidence_flags || [])
+          .filter(c => c.confidence < 0.8)
+          .map(c => ({ cell: c.cell, format: { fill: { color: "FFFF00" } } }));
+
+        return {
+          headerMatrix,
+          footerMatrix,
+          lineItems,
+          flaggedCells,
+          hasFlaggedCells: flaggedCells.length > 0,
+          workbookId: steps['clone-template'].output.fileId
+        };
+
+  # ── 5a. Update header range (runs parallel with footer) ───────────
+  - id: update-header
+    name: "Write header data to Excel"
+    type: document
+    depends_on: [prepare-data]
+    config:
+      provider: microsoft-excel
+      credential_ref: "${{ secrets.excel_oauth }}"
+      operation: update_range
+      workbook_id: "${{ steps.prepare-data.output.workbookId }}"
+      worksheet: "Sheet1"
+      range: "A4:E5"
+      data: "${{ steps.prepare-data.output.headerMatrix }}"
+    retry:
+      max_attempts: 2
+      delay: 1s
+      backoff: fixed
+
+  # ── 5b. Update footer range (runs parallel with header) ───────────
+  - id: update-footer
+    name: "Write footer totals to Excel"
+    type: document
+    depends_on: [prepare-data]
+    config:
+      provider: microsoft-excel
+      credential_ref: "${{ secrets.excel_oauth }}"
+      operation: update_range
+      workbook_id: "${{ steps.prepare-data.output.workbookId }}"
+      worksheet: "Sheet1"
+      range: "A20:E20"
+      data: "${{ steps.prepare-data.output.footerMatrix }}"
+    retry:
+      max_attempts: 2
+      delay: 1s
+      backoff: fixed
+
+  # ── 6. Sync after header + footer ─────────────────────────────────
+  - id: after-header-footer
+    name: "Wait for parallel writes to complete"
+    type: noop
+    depends_on: [update-header, update-footer]
+    merge_strategy: choose
+    merge_input: update-footer
+    description: >
+      Merge point: waits for both parallel writes to complete,
+      then passes the footer step's output downstream.
+
+  # ── 7. Insert line items sequentially ──────────────────────────────
+  - id: insert-line-items
+    name: "Insert detail rows into table"
+    type: for_each
+    depends_on: [after-header-footer]
+    config:
+      items: "${{ steps.prepare-data.output.lineItems }}"
+      iterator_var: item
+      concurrency: 1                   # Sequential — API cannot handle concurrent table writes
+      steps:
+        - id: add-detail-row
+          type: document
+          config:
+            provider: microsoft-excel
+            credential_ref: "${{ secrets.excel_oauth }}"
+            operation: add_table_row
+            workbook_id: "${{ steps.prepare-data.output.workbookId }}"
+            worksheet: "Sheet1"
+            table: "DetailTable"
+            data: "${{ item }}"
+          retry:
+            max_attempts: 2
+            delay: 1s
+            backoff: fixed
+
+  # ── 8. Highlight flagged cells (conditional) ───────────────────────
+  - id: highlight-flagged-cells
+    name: "Highlight low-confidence cells"
+    type: for_each
+    depends_on: [insert-line-items]
+    condition: "${{ steps.prepare-data.output.hasFlaggedCells == true }}"
+    config:
+      items: "${{ steps.prepare-data.output.flaggedCells }}"
+      iterator_var: cell
+      concurrency: 1
+      steps:
+        - id: format-cell
+          type: document
+          config:
+            provider: microsoft-excel
+            credential_ref: "${{ secrets.excel_oauth }}"
+            operation: update_range
+            workbook_id: "${{ steps.prepare-data.output.workbookId }}"
+            worksheet: "Sheet1"
+            range: "${{ cell.cell }}"
+            format: "${{ cell.format }}"
+
+  # ── 9. Share the Excel file ────────────────────────────────────────
+  - id: share-file
+    name: "Share file with organization"
+    type: document
+    depends_on: [highlight-flagged-cells]
+    execution_mode: once
+    config:
+      provider: microsoft-excel
+      credential_ref: "${{ secrets.drive_oauth }}"
+      operation: share
+      workbook_id: "${{ steps.prepare-data.output.workbookId }}"
+      share_type: view
+      scope: organization
+
+  # ── 10. Download the completed Excel ───────────────────────────────
+  - id: download-excel
+    name: "Download completed report"
+    type: document
+    depends_on: [share-file]
+    execution_mode: once
+    config:
+      provider: microsoft-excel
+      credential_ref: "${{ secrets.drive_oauth }}"
+      operation: download
+      workbook_id: "${{ steps.prepare-data.output.workbookId }}"
+    description: "Downloads the file as binary for cloud upload."
+
+  # ── 11. Upload Excel via multipart POST ────────────────────────────
+  - id: upload-report
+    name: "Upload report to cloud storage"
+    type: http
+    depends_on: [download-excel]
+    execution_mode: once
+    config:
+      method: POST
+      url: "${{ variables.upload_service_url }}"
+      content_type: multipart/form-data
+      parts:
+        - name: env
+          value: "${{ trigger.body.env }}"
+        - name: action
+          value: upload
+        - name: folderPath
+          value: "${{ variables.output_folder }}/${{ trigger.body.report_id }}"
+        - name: file
+          binary_ref: "${{ steps.download-excel.output.binary }}"
+          filename: "Report_${{ trigger.body.report_id }}.xlsx"
+      timeout: 60s
+      response_format: json
+    retry:
+      max_attempts: 3
+      delay: 5s
+      backoff: exponential
+
+  # ── 12. Respond to webhook ─────────────────────────────────────────
+  - id: respond-report
+    name: "Respond with report URL"
+    type: respond
+    depends_on: [upload-report]
+    config:
+      status_code: 200
+      body:
+        success: true
+        message: "Report generated and uploaded"
+        report_id: "${{ trigger.body.report_id }}"
+        download_url: "${{ steps.upload-report.output.body.url }}"
+        env: "${{ trigger.body.env }}"
+
+  # ═════════════════════════════════════════════════════════════════════
+  # Steps — Attachment Upload Pipeline (trigger: upload-attachment)
+  # ═════════════════════════════════════════════════════════════════════
+
+  - id: attachment-create-folder
+    name: "Create attachment folder"
+    type: http
+    trigger_ref: upload-attachment
+    config:
+      method: POST
+      url: "${{ variables.folder_service_url }}"
+      headers:
+        Content-Type: application/json
+      body:
+        action: create
+        folder_name: "${{ trigger.body.report_id }}"
+        parent_path: "${{ variables.output_folder }}"
+      timeout: 30s
+      response_format: json
+
+  - id: attachment-upload
+    name: "Upload attachment file"
+    type: http
+    depends_on: [attachment-create-folder]
+    config:
+      method: POST
+      url: "${{ variables.upload_service_url }}"
+      content_type: multipart/form-data
+      parts:
+        - name: env
+          value: "${{ trigger.body.env }}"
+        - name: action
+          value: upload
+        - name: folderPath
+          value: "${{ variables.output_folder }}/${{ trigger.body.report_id }}/Attachments"
+        - name: file
+          binary_ref: "${{ trigger.binary }}"
+          filename: "${{ trigger.body.fileName }}"
+      timeout: 60s
+      response_format: json
+    retry:
+      max_attempts: 3
+      delay: 5s
+      backoff: exponential
+
+  - id: respond-attachment
+    name: "Respond to attachment upload"
+    type: respond
+    depends_on: [attachment-upload]
+    config:
+      status_code: 200
+      body:
+        success: true
+        message: "Attachment uploaded"
+        report_id: "${{ trigger.body.report_id }}"
+
+# ─── Global Error Handler ───────────────────────────────────────────
+on_error:
+  strategy: fail_fast
+  handler:
+    steps:
+      - id: notify-failure
+        type: notification
+        config:
+          channel: webhook
+          url: "${{ env.OPS_WEBHOOK_URL }}"
+          method: POST
+          payload:
+            alert: "report_generation_failed"
+            workflow: "${{ workflow.name }}"
+            step: "${{ error.step_id }}"
+            error: "${{ error.message }}"
+            report_id: "${{ trigger.body.report_id }}"
+            env: "${{ trigger.body.env }}"

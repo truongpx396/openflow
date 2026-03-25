@@ -1,0 +1,399 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://openflow.dev/schemas/v1.0.0/workflow.json",
+  "title": "OpenFlow Workflow Specification v1.0.0",
+  "description": "A vendor-neutral, YAML-based DSL for defining complex automation workflows. Apache 2.0 licensed.",
+  "type": "object",
+  "required": ["openflow", "metadata", "steps"],
+  "additionalProperties": false,
+  "properties": {
+    "openflow": {
+      "type": "string",
+      "description": "Specification version. Must be a valid semver string.",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "examples": ["1.0.0"]
+    },
+    "metadata": { "$ref": "#/definitions/metadata" },
+    "triggers": {
+      "type": "array",
+      "description": "List of triggers that can initiate this workflow.",
+      "items": { "$ref": "#/definitions/trigger" }
+    },
+    "variables": {
+      "type": "object",
+      "description": "Workflow-level variables accessible by all steps.",
+      "additionalProperties": true
+    },
+    "secrets": {
+      "type": "array",
+      "description": "References to secrets needed by this workflow. Never inline secret values.",
+      "items": { "$ref": "#/definitions/secretRef" }
+    },
+    "steps": {
+      "type": "array",
+      "description": "Ordered list of workflow steps.",
+      "minItems": 1,
+      "items": { "$ref": "#/definitions/step" }
+    },
+    "profiles": {
+      "type": "object",
+      "description": "Named configuration profiles for different environments (e.g., dev, uat, prod). Each profile overrides variables and secrets.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "variables": {
+            "type": "object",
+            "description": "Variable overrides for this profile.",
+            "additionalProperties": true
+          },
+          "secrets": {
+            "type": "object",
+            "description": "Secret reference overrides for this profile.",
+            "additionalProperties": { "type": "string" }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "on_error": { "$ref": "#/definitions/globalErrorHandler" },
+    "extensions": {
+      "type": "array",
+      "description": "Custom extensions to register additional step types.",
+      "items": { "$ref": "#/definitions/extension" }
+    }
+  },
+  "definitions": {
+    "metadata": {
+      "type": "object",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Unique workflow identifier. Use kebab-case.",
+          "pattern": "^[a-z0-9][a-z0-9-]*[a-z0-9]$"
+        },
+        "version": {
+          "type": "string",
+          "description": "Workflow version in semver format.",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of the workflow."
+        },
+        "labels": {
+          "type": "object",
+          "description": "Key-value pairs for filtering and grouping.",
+          "additionalProperties": { "type": "string" }
+        },
+        "annotations": {
+          "type": "object",
+          "description": "Arbitrary metadata for tooling and documentation.",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "trigger": {
+      "type": "object",
+      "required": ["type", "id", "config"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["webhook", "schedule", "queue", "event", "manual"],
+          "description": "The type of trigger."
+        },
+        "id": {
+          "type": "string",
+          "description": "Unique trigger identifier."
+        },
+        "config": {
+          "type": "object",
+          "description": "Type-specific trigger configuration.",
+          "additionalProperties": true,
+          "properties": {
+            "method": { "type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"] },
+            "path": { "type": "string" },
+            "response_mode": { "type": "string", "enum": ["immediate", "deferred", "stream"] },
+            "cron": { "type": "string" },
+            "timezone": { "type": "string" },
+            "provider": { "type": "string" },
+            "queue_url": { "type": "string" },
+            "credential_ref": { "type": "string" },
+            "batch_size": { "type": "integer", "minimum": 1 },
+            "source": { "type": "string" },
+            "event_type": { "type": "string" },
+            "filter": { "type": "object", "additionalProperties": true },
+            "authentication": { "$ref": "#/definitions/authentication" },
+            "description": { "type": "string" },
+            "input_schema": {
+              "type": "object",
+              "description": "JSON Schema for manual trigger input form. Runtimes render a form from this schema.",
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "authentication": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["bearer", "basic", "api_key", "oauth2", "none"] },
+        "secret_ref": { "type": "string" }
+      }
+    },
+    "secretRef": {
+      "type": "object",
+      "required": ["id", "provider"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "description": "Unique secret reference identifier." },
+        "provider": {
+          "type": "string",
+          "enum": ["env", "vault", "aws-secrets-manager", "gcp-secret-manager", "azure-key-vault"],
+          "description": "Secret provider type."
+        },
+        "path": { "type": "string", "description": "Path in the secret store." },
+        "key": { "type": "string", "description": "Environment variable name (for provider=env)." }
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": ["id", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique step identifier within the workflow."
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable step name."
+        },
+        "type": {
+          "type": "string",
+          "description": "Step type. Built-in types or ext/<extension>.<operation>.",
+          "anyOf": [
+            { "enum": ["http", "transform", "script", "storage", "database", "queue", "notification", "subflow", "respond", "noop", "branch", "switch", "parallel", "gate_chain", "for_each", "while", "try", "document", "ai", "approval", "wait"] },
+            { "pattern": "^ext/.+\\..+$" }
+          ]
+        },
+        "trigger_ref": {
+          "type": "string",
+          "description": "Associates this step tree with a specific trigger."
+        },
+        "config": {
+          "type": "object",
+          "description": "Type-specific step configuration.",
+          "additionalProperties": true
+        },
+        "input": {
+          "type": "object",
+          "description": "Data mapping into the step.",
+          "additionalProperties": true
+        },
+        "output": {
+          "type": "object",
+          "description": "Data mapping from the step output.",
+          "additionalProperties": true
+        },
+        "depends_on": {
+          "type": "array",
+          "description": "Step IDs that must complete before this step runs.",
+          "items": { "type": "string" }
+        },
+        "merge_strategy": {
+          "type": "string",
+          "enum": ["combine", "first", "last", "choose"],
+          "description": "When depends_on has multiple steps, how to merge their outputs.",
+          "default": "combine"
+        },
+        "merge_input": {
+          "type": "string",
+          "description": "When merge_strategy=choose, the step ID whose output to use."
+        },
+        "execution_mode": {
+          "type": "string",
+          "enum": ["per_item", "once"],
+          "description": "Whether the step runs once or once per input item.",
+          "default": "per_item"
+        },
+        "emit_on_empty": {
+          "type": "boolean",
+          "description": "If true, emit an empty output when the operation produces nothing.",
+          "default": false
+        },
+        "condition": {
+          "type": "string",
+          "description": "Expression that must evaluate to true for step to run."
+        },
+        "retry": { "$ref": "#/definitions/retryPolicy" },
+        "timeout": {
+          "type": "string",
+          "description": "Step timeout duration (e.g., '30s', '5m', '1h', '1d').",
+          "pattern": "^\\d+[smhd]$"
+        },
+        "on_error": { "$ref": "#/definitions/stepErrorHandler" },
+        "metadata": {
+          "type": "object",
+          "description": "Arbitrary annotations for the step.",
+          "additionalProperties": true
+        },
+        "wait_for": {
+          "type": "array",
+          "description": "For noop/sync steps: step IDs to wait for.",
+          "items": { "type": "string" }
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of the step's purpose."
+        },
+        "circuit_breaker": {
+          "type": "object",
+          "description": "Circuit breaker pattern to prevent repeated calls to a failing service.",
+          "additionalProperties": false,
+          "properties": {
+            "failure_threshold": { "type": "integer", "minimum": 1, "description": "Number of failures before opening the circuit." },
+            "reset_timeout": { "type": "string", "description": "Duration before attempting a half-open probe (e.g., '60s', '5m').", "pattern": "^\\d+[smhd]$" },
+            "half_open_requests": { "type": "integer", "minimum": 1, "description": "Number of trial requests in half-open state before closing.", "default": 1 }
+          },
+          "required": ["failure_threshold", "reset_timeout"]
+        },
+        "cache": {
+          "type": "object",
+          "description": "Cache step output by key to avoid redundant executions.",
+          "additionalProperties": false,
+          "properties": {
+            "key": { "type": "string", "description": "Cache key expression. Supports ${{ }} interpolation." },
+            "ttl": { "type": "string", "description": "Time-to-live for cached value (e.g., '1h', '30m').", "pattern": "^\\d+[smhd]$" },
+            "invalidate_on": { "type": "string", "description": "Expression or event that invalidates this cache entry." }
+          },
+          "required": ["key", "ttl"]
+        },
+        "rate_limit": {
+          "type": "object",
+          "description": "Limit how often this step can execute.",
+          "additionalProperties": false,
+          "properties": {
+            "max": { "type": "integer", "minimum": 1, "description": "Maximum number of executions allowed in the window." },
+            "per": { "type": "string", "description": "Time window (e.g., '1m', '1h', '1d').", "pattern": "^\\d+[smhd]$" },
+            "on_limit": { "type": "string", "enum": ["wait", "fail", "skip"], "description": "Behavior when rate limit is hit.", "default": "wait" },
+            "scope": { "type": "string", "enum": ["workflow", "global"], "description": "Whether limit is per workflow run or global across all runs.", "default": "workflow" }
+          },
+          "required": ["max", "per"]
+        },
+        "log": {
+          "type": "object",
+          "description": "Structured logging for the step. Emits key-value context for observability.",
+          "additionalProperties": false,
+          "properties": {
+            "level": { "type": "string", "enum": ["debug", "info", "warn", "error"], "description": "Log level for this step.", "default": "info" },
+            "message": { "type": "string", "description": "Log message template. Supports ${{ }} interpolation." },
+            "context": { "type": "object", "description": "Key-value pairs to include in the log entry.", "additionalProperties": true },
+            "on_start": { "type": "boolean", "description": "Emit a log entry when the step starts.", "default": false },
+            "on_complete": { "type": "boolean", "description": "Emit a log entry when the step completes.", "default": true },
+            "on_error": { "type": "boolean", "description": "Emit a log entry when the step errors.", "default": true }
+          }
+        }
+      }
+    },
+    "retryPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Maximum number of retry attempts."
+        },
+        "delay": {
+          "type": "string",
+          "description": "Initial delay between retries.",
+          "pattern": "^\\d+[smhd]$"
+        },
+        "backoff": {
+          "type": "string",
+          "enum": ["fixed", "exponential", "linear"],
+          "description": "Backoff strategy."
+        },
+        "max_delay": {
+          "type": "string",
+          "description": "Maximum delay cap for backoff.",
+          "pattern": "^\\d+[smhd]$"
+        },
+        "retry_on": {
+          "type": "array",
+          "description": "Conditions under which to retry.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "status_code": {
+                "type": "array",
+                "items": { "type": "integer" }
+              },
+              "error_type": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "stepErrorHandler": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": ["fail", "continue", "fallback"],
+          "description": "Error handling strategy."
+        },
+        "fallback_step": {
+          "type": "string",
+          "description": "Step ID to execute on failure (when strategy=fallback)."
+        },
+        "output": {
+          "type": "object",
+          "description": "Output to produce on error when strategy=continue.",
+          "additionalProperties": true
+        }
+      }
+    },
+    "globalErrorHandler": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": ["fail_fast", "collect_all", "ignore"],
+          "description": "Global error strategy."
+        },
+        "handler": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "steps": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/step" }
+            }
+          }
+        }
+      }
+    },
+    "extension": {
+      "type": "object",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "description": "Extension name." },
+        "version": { "type": "string", "description": "Extension version." },
+        "source": { "type": "string", "description": "URL or registry path to the extension." },
+        "config": {
+          "type": "object",
+          "description": "Extension-level configuration.",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,666 @@
+# yaml-language-server: $schema=../schemas/openflow-v1.0.0.schema.json
+# ══════════════════════════════════════════════════════════════════════
+# AI-Powered Support Ticket Triage & Resolution Workflow
+# ══════════════════════════════════════════════════════════════════════
+# OpenFlow YAML DSL v1.0.0 — Example Workflow
+#
+# This workflow demonstrates an intelligent support-ticket pipeline:
+#   1. Receives tickets via manual form, queue, or system event
+#   2. AI classifies ticket category + severity
+#   3. Database lookup for customer context + SLA
+#   4. Human approval for high-severity escalations
+#   5. Waits for customer reply via webhook callback
+#   6. Polls external ticketing system until resolution
+#   7. try/catch/finally for guaranteed audit logging
+#
+# Features showcased (not covered by other examples):
+#   - manual trigger (with input_schema form)
+#   - queue trigger, event trigger
+#   - ai step (classification + structured output)
+#   - database step (SQL query + insert)
+#   - approval step (with form fields)
+#   - wait step (webhook callback + delay)
+#   - while loop (poll until resolved)
+#   - try / catch / finally
+#   - transform step (JSONata)
+#   - subflow step
+#   - cache, rate_limit, log, circuit_breaker step policies
+#   - emit_on_empty
+#   - extensions (custom AI prompt templates)
+# ══════════════════════════════════════════════════════════════════════
+
+openflow: "1.0.0"
+
+metadata:
+  name: support-ticket-triage
+  version: "1.0.0"
+  description: >
+    AI-powered support ticket triage, routing, and resolution tracking.
+    Classifies incoming tickets, enriches with customer data, escalates
+    high-severity issues for human approval, waits for customer responses,
+    and polls until resolution.
+  labels:
+    team: customer-support
+    domain: support-ops
+  annotations:
+    owner: support-engineering
+    sla: "15m"
+
+# ─── Extensions ──────────────────────────────────────────────────────
+extensions:
+  - name: prompt-templates
+    version: "1.0.0"
+    source: "https://registry.example.com/extensions/prompt-templates"
+    config:
+      template_dir: "./prompts"
+
+# ─── Triggers ────────────────────────────────────────────────────────
+triggers:
+  # Manual trigger — agent submits a ticket via UI form
+  - type: manual
+    id: submit-ticket
+    config:
+      description: "Manually submit a support ticket for triage"
+      input_schema:
+        type: object
+        required: [customer_email, subject, body]
+        properties:
+          customer_email:
+            type: string
+            title: "Customer Email"
+            format: email
+          subject:
+            type: string
+            title: "Ticket Subject"
+          body:
+            type: string
+            title: "Ticket Description"
+          priority_hint:
+            type: string
+            title: "Priority Hint"
+            enum: [low, medium, high, critical]
+            default: medium
+          attachments:
+            type: array
+            title: "Attachments"
+            items:
+              type: string
+
+  # Queue trigger — tickets arriving from external helpdesk
+  - type: queue
+    id: helpdesk-queue
+    config:
+      provider: aws-sqs
+      queue_url: "${{ env.HELPDESK_QUEUE_URL }}"
+      credential_ref: aws-credentials
+      batch_size: 1
+
+  # Event trigger — auto-escalation from monitoring alerts
+  - type: event
+    id: monitoring-alert
+    config:
+      source: datadog
+      event_type: alert.triggered
+      filter:
+        severity: critical
+        service: production
+
+# ─── Variables ───────────────────────────────────────────────────────
+variables:
+  ticket_id: "${{ trigger.body.ticket_id || uuid() }}"
+  customer_email: "${{ trigger.body.customer_email || trigger.body.email }}"
+  subject: "${{ trigger.body.subject }}"
+  body: "${{ trigger.body.body || trigger.body.description }}"
+  created_at: "${{ now() }}"
+
+# ─── Secrets ─────────────────────────────────────────────────────────
+secrets:
+  - id: aws-credentials
+    provider: aws-secrets-manager
+    path: "/prod/support/aws"
+  - id: openai-credentials
+    provider: vault
+    path: "secret/support/openai"
+  - id: db-credentials
+    provider: vault
+    path: "secret/support/postgres"
+  - id: slack_webhook
+    provider: env
+    key: SLACK_WEBHOOK_URL
+  - id: pagerduty_token
+    provider: env
+    key: PAGERDUTY_API_TOKEN
+
+# ═════════════════════════════════════════════════════════════════════
+# Steps — Main Triage Pipeline
+# ═════════════════════════════════════════════════════════════════════
+steps:
+
+  # ── 1. AI Classification ──────────────────────────────────────────
+  # Uses the ai step with structured output to classify ticket category
+  # and severity. Rate-limited to respect OpenAI API quotas.
+  - id: classify-ticket
+    name: "AI ticket classification"
+    type: ai
+    trigger_ref: submit-ticket
+    config:
+      provider: openai
+      credential_ref: openai-credentials
+      operation: chat
+      model: gpt-4o
+      messages:
+        - role: system
+          content: |
+            You are a support ticket classifier. Given a ticket subject and body,
+            determine the category and severity.
+            Categories: billing, technical, feature_request, account, security, other.
+            Severity: low, medium, high, critical.
+        - role: user
+          content: |
+            Subject: ${{ variables.subject }}
+            Body: ${{ variables.body }}
+      temperature: 0.1
+      max_tokens: 200
+      response_format: structured
+      response_schema:
+        type: object
+        properties:
+          category:
+            type: string
+            enum: [billing, technical, feature_request, account, security, other]
+          severity:
+            type: string
+            enum: [low, medium, high, critical]
+          summary:
+            type: string
+          suggested_tags:
+            type: array
+            items:
+              type: string
+          confidence:
+            type: number
+        required: [category, severity, summary]
+    rate_limit:
+      max: 60
+      per: 1m
+      on_limit: wait
+    log:
+      level: info
+      message: "Classifying ticket ${{ variables.ticket_id }}"
+      context:
+        ticket_id: "${{ variables.ticket_id }}"
+        customer: "${{ variables.customer_email }}"
+      on_start: true
+      on_complete: true
+      on_error: true
+
+  # ── 2. Customer Lookup (Database) ─────────────────────────────────
+  # Query the customer database for account info and SLA tier.
+  # Cached for 30 minutes to avoid redundant lookups for the same customer.
+  - id: lookup-customer
+    name: "Lookup customer profile and SLA"
+    type: database
+    depends_on: [classify-ticket]
+    config:
+      provider: postgres
+      credential_ref: db-credentials
+      operation: query
+      query: |
+        SELECT c.id, c.name, c.email, c.company, c.tier,
+               s.response_time_minutes, s.resolution_time_hours,
+               c.account_manager_email,
+               COUNT(t.id) AS open_ticket_count
+        FROM customers c
+        JOIN sla_tiers s ON s.tier = c.tier
+        LEFT JOIN tickets t ON t.customer_id = c.id AND t.status = 'open'
+        WHERE c.email = $1
+        GROUP BY c.id, c.name, c.email, c.company, c.tier,
+                 s.response_time_minutes, s.resolution_time_hours,
+                 c.account_manager_email
+      params:
+        - "${{ variables.customer_email }}"
+    cache:
+      key: "customer-profile:${{ variables.customer_email }}"
+      ttl: 30m
+
+  # ── 3. Transform — Merge classification + customer into ticket ────
+  - id: build-ticket
+    name: "Build enriched ticket object"
+    type: transform
+    depends_on: [classify-ticket, lookup-customer]
+    config:
+      language: jsonata
+      expression: |
+        {
+          "ticket_id": $$.variables.ticket_id,
+          "subject": $$.variables.subject,
+          "body": $$.variables.body,
+          "customer": $lookup_customer,
+          "classification": $classify_ticket,
+          "sla": {
+            "response_minutes": $lookup_customer.response_time_minutes,
+            "resolution_hours": $lookup_customer.resolution_time_hours,
+            "deadline": $now() + $lookup_customer.resolution_time_hours * 3600000
+          },
+          "needs_escalation": $classify_ticket.severity in ["high", "critical"]
+                              or $lookup_customer.tier = "enterprise",
+          "created_at": $$.variables.created_at
+        }
+    input:
+      classify_ticket: "${{ steps.classify-ticket.output.result }}"
+      lookup_customer: "${{ steps.lookup-customer.output[0] }}"
+
+  # ── 4. Save ticket to database ────────────────────────────────────
+  - id: save-ticket
+    name: "Insert ticket into database"
+    type: database
+    depends_on: [build-ticket]
+    config:
+      provider: postgres
+      credential_ref: db-credentials
+      operation: execute
+      query: |
+        INSERT INTO tickets (id, customer_id, subject, body, category, severity,
+                             status, sla_deadline, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, 'open', $7, $8)
+      params:
+        - "${{ variables.ticket_id }}"
+        - "${{ steps.build-ticket.output.customer.id }}"
+        - "${{ variables.subject }}"
+        - "${{ variables.body }}"
+        - "${{ steps.build-ticket.output.classification.category }}"
+        - "${{ steps.build-ticket.output.classification.severity }}"
+        - "${{ steps.build-ticket.output.sla.deadline }}"
+        - "${{ variables.created_at }}"
+
+  # ── 5. Route: escalation vs auto-reply ─────────────────────────────
+  - id: route-ticket
+    name: "Route based on escalation need"
+    type: branch
+    depends_on: [save-ticket]
+    config:
+      conditions:
+        - id: needs-escalation
+          when: "${{ steps.build-ticket.output.needs_escalation == true }}"
+          then: escalation-approval
+        - id: auto-handle
+          when: true
+          then: send-auto-reply
+
+  # ═════════════════════════════════════════════════════════════════
+  # PATH A: Human Approval Escalation
+  # ═════════════════════════════════════════════════════════════════
+
+  # ── 6. Human approval with form fields ─────────────────────────────
+  - id: escalation-approval
+    name: "Manager reviews escalated ticket"
+    type: approval
+    config:
+      prompt: |
+        Escalated ticket requires review:
+        Ticket: #${{ variables.ticket_id }}
+        Customer: ${{ steps.build-ticket.output.customer.name }} (${{ steps.build-ticket.output.customer.tier }} tier)
+        Category: ${{ steps.build-ticket.output.classification.category }}
+        Severity: ${{ steps.build-ticket.output.classification.severity }}
+        Summary: ${{ steps.build-ticket.output.classification.summary }}
+      assignees:
+        - "${{ steps.build-ticket.output.customer.account_manager_email }}"
+      actions:
+        - id: approve-escalation
+          label: "Escalate to Engineering"
+        - id: reassign
+          label: "Reassign to Another Team"
+        - id: close
+          label: "Close — No Action Needed"
+      fields:
+        - id: assigned_team
+          label: "Assign to Team"
+          type: select
+          options: ["Backend", "Frontend", "Infrastructure", "Security", "Billing"]
+          required: true
+        - id: internal_notes
+          label: "Internal Notes"
+          type: textarea
+        - id: priority_override
+          label: "Override Priority"
+          type: select
+          options: ["low", "medium", "high", "critical"]
+      timeout: 4h
+      on_timeout: approve-escalation
+      notification:
+        channel: slack
+        template: escalation-review
+    log:
+      level: warn
+      message: "Escalation pending for ticket ${{ variables.ticket_id }}"
+      context:
+        ticket_id: "${{ variables.ticket_id }}"
+        severity: "${{ steps.build-ticket.output.classification.severity }}"
+        customer_tier: "${{ steps.build-ticket.output.customer.tier }}"
+      on_start: true
+      on_complete: true
+
+  # ── 7. Update ticket with approval decision ───────────────────────
+  - id: update-ticket-after-approval
+    name: "Record approval decision in database"
+    type: database
+    depends_on: [escalation-approval]
+    config:
+      provider: postgres
+      credential_ref: db-credentials
+      operation: execute
+      query: |
+        UPDATE tickets
+        SET assigned_team = $1,
+            internal_notes = $2,
+            severity = COALESCE($3, severity),
+            status = CASE WHEN $4 = 'close' THEN 'closed' ELSE 'escalated' END,
+            updated_at = NOW()
+        WHERE id = $5
+      params:
+        - "${{ steps.escalation-approval.output.fields.assigned_team }}"
+        - "${{ steps.escalation-approval.output.fields.internal_notes }}"
+        - "${{ steps.escalation-approval.output.fields.priority_override }}"
+        - "${{ steps.escalation-approval.output.action }}"
+        - "${{ variables.ticket_id }}"
+
+  # ── 8. Run resolution subflow ──────────────────────────────────────
+  - id: run-resolution
+    name: "Trigger the resolution workflow"
+    type: subflow
+    depends_on: [update-ticket-after-approval]
+    condition: "${{ steps.escalation-approval.output.action != 'close' }}"
+    config:
+      workflow_ref: ticket-resolution-pipeline
+      version: "^1.0.0"
+      input:
+        ticket_id: "${{ variables.ticket_id }}"
+        assigned_team: "${{ steps.escalation-approval.output.fields.assigned_team }}"
+        customer_email: "${{ variables.customer_email }}"
+      await: false
+
+  # ═════════════════════════════════════════════════════════════════
+  # PATH B: Auto-Reply & Wait for Customer
+  # ═════════════════════════════════════════════════════════════════
+
+  # ── 9. Generate auto-reply with AI ─────────────────────────────────
+  - id: send-auto-reply
+    name: "AI-generated initial response"
+    type: ai
+    config:
+      provider: openai
+      credential_ref: openai-credentials
+      operation: chat
+      model: gpt-4o
+      template_ref: support-auto-reply
+      template_vars:
+        customer_name: "${{ steps.build-ticket.output.customer.name }}"
+        category: "${{ steps.build-ticket.output.classification.category }}"
+        summary: "${{ steps.build-ticket.output.classification.summary }}"
+        ticket_id: "${{ variables.ticket_id }}"
+      max_tokens: 500
+      response_format: text
+    rate_limit:
+      max: 30
+      per: 1m
+      on_limit: wait
+      scope: global
+    circuit_breaker:
+      failure_threshold: 5
+      reset_timeout: 2m
+      half_open_requests: 1
+
+  # ── 10. Send the reply to customer ─────────────────────────────────
+  - id: send-email-reply
+    name: "Email auto-reply to customer"
+    type: notification
+    depends_on: [send-auto-reply]
+    config:
+      channel: email
+      to: "${{ variables.customer_email }}"
+      subject: "Re: ${{ variables.subject }} [#${{ variables.ticket_id }}]"
+      body: "${{ steps.send-auto-reply.output.result }}"
+      reply_to: "support@example.com"
+
+  # ── 11. Wait for customer reply ────────────────────────────────────
+  # Pauses until the customer replies via a callback webhook,
+  # or times out after 48h.
+  - id: wait-for-customer-reply
+    name: "Wait for customer to respond"
+    type: wait
+    depends_on: [send-email-reply]
+    config:
+      resume_on: webhook
+      timeout: 48h
+      on_timeout: continue
+
+  # ── 12. Process customer reply or close on timeout ─────────────────
+  - id: handle-customer-response
+    name: "Route based on customer response"
+    type: branch
+    depends_on: [wait-for-customer-reply]
+    config:
+      conditions:
+        - id: customer-replied
+          when: "${{ steps.wait-for-customer-reply.output.payload != null }}"
+          then: update-with-reply
+        - id: no-response
+          when: true
+          then: auto-close-ticket
+
+  - id: update-with-reply
+    name: "Save customer reply to database"
+    type: database
+    config:
+      provider: postgres
+      credential_ref: db-credentials
+      operation: execute
+      query: |
+        INSERT INTO ticket_messages (ticket_id, sender, body, created_at)
+        VALUES ($1, 'customer', $2, NOW())
+      params:
+        - "${{ variables.ticket_id }}"
+        - "${{ steps.wait-for-customer-reply.output.payload.message }}"
+
+  # ═════════════════════════════════════════════════════════════════
+  # Resolution Polling (while loop)
+  # ═════════════════════════════════════════════════════════════════
+
+  # ── 13. Poll ticketing system until resolved ───────────────────────
+  - id: poll-until-resolved
+    name: "Poll external system for resolution status"
+    type: while
+    depends_on: [update-with-reply]
+    config:
+      condition: "${{ output.status != 'resolved' && output.status != 'closed' }}"
+      max_iterations: 48
+      delay_between: 30m
+      steps:
+        - id: check-ticket-status
+          type: http
+          config:
+            method: GET
+            url: "${{ env.TICKETING_API_URL }}/tickets/${{ variables.ticket_id }}/status"
+          cache:
+            key: "ticket-status:${{ variables.ticket_id }}"
+            ttl: 5m
+
+  # ── 14. Mark resolved in database ──────────────────────────────────
+  - id: mark-resolved
+    name: "Update ticket status to resolved"
+    type: database
+    depends_on: [poll-until-resolved]
+    config:
+      provider: postgres
+      credential_ref: db-credentials
+      operation: execute
+      query: |
+        UPDATE tickets SET status = 'resolved', resolved_at = NOW() WHERE id = $1
+      params:
+        - "${{ variables.ticket_id }}"
+
+  # ═════════════════════════════════════════════════════════════════
+  # Auto-Close Path
+  # ═════════════════════════════════════════════════════════════════
+
+  - id: auto-close-ticket
+    name: "Auto-close ticket after timeout"
+    type: database
+    config:
+      provider: postgres
+      credential_ref: db-credentials
+      operation: execute
+      query: |
+        UPDATE tickets SET status = 'auto-closed', resolved_at = NOW(),
+               internal_notes = 'Auto-closed: no customer response within 48h'
+        WHERE id = $1
+      params:
+        - "${{ variables.ticket_id }}"
+
+  # ═════════════════════════════════════════════════════════════════
+  # Queue Trigger Pipeline — Helpdesk Integration
+  # ═════════════════════════════════════════════════════════════════
+
+  # ── Tickets from external helpdesk queue ───────────────────────────
+  - id: process-queue-ticket
+    name: "Transform helpdesk queue message"
+    type: transform
+    trigger_ref: helpdesk-queue
+    config:
+      language: jsonata
+      expression: |
+        {
+          "ticket_id": body.external_id,
+          "customer_email": body.requester.email,
+          "subject": body.title,
+          "body": body.description,
+          "source": "helpdesk"
+        }
+    emit_on_empty: true
+
+  - id: forward-to-triage
+    name: "Forward to main triage via subflow"
+    type: subflow
+    depends_on: [process-queue-ticket]
+    config:
+      workflow_ref: support-ticket-triage
+      version: "1.0.0"
+      input: "${{ steps.process-queue-ticket.output }}"
+      await: false
+
+  # ═════════════════════════════════════════════════════════════════
+  # Event Trigger Pipeline — Monitoring Alert Auto-Escalation
+  # ═════════════════════════════════════════════════════════════════
+
+  # ── Critical production alert → immediate ticket + escalation ──────
+  - id: handle-alert
+    name: "Create ticket from monitoring alert"
+    type: try
+    trigger_ref: monitoring-alert
+    config:
+      steps:
+        - id: create-alert-ticket
+          type: database
+          config:
+            provider: postgres
+            credential_ref: db-credentials
+            operation: execute
+            query: |
+              INSERT INTO tickets (id, subject, body, category, severity, status, created_at)
+              VALUES ($1, $2, $3, 'technical', 'critical', 'open', NOW())
+            params:
+              - "${{ uuid() }}"
+              - "ALERT: ${{ trigger.body.alert_title }}"
+              - "${{ trigger.body.alert_description }}"
+
+        - id: notify-on-call
+          type: notification
+          depends_on: [create-alert-ticket]
+          config:
+            channel: slack
+            url: "${{ secrets.slack_webhook }}"
+            payload:
+              text: "🚨 Critical alert auto-escalated"
+              alert: "${{ trigger.body.alert_title }}"
+              service: "${{ trigger.body.service }}"
+              dashboard: "${{ trigger.body.dashboard_url }}"
+
+        - id: page-engineer
+          type: http
+          depends_on: [create-alert-ticket]
+          config:
+            method: POST
+            url: "${{ env.PAGERDUTY_API_URL }}/incidents"
+            headers:
+              Authorization: "Token token=${{ secrets.pagerduty_token }}"
+              Content-Type: application/json
+            body:
+              incident:
+                title: "${{ trigger.body.alert_title }}"
+                service:
+                  id: "${{ trigger.body.pagerduty_service_id }}"
+                urgency: high
+          circuit_breaker:
+            failure_threshold: 3
+            reset_timeout: 5m
+            half_open_requests: 1
+          retry:
+            max_attempts: 3
+            delay: 5s
+            backoff: exponential
+
+        # Wait 15 minutes for engineer acknowledgment
+        - id: wait-for-ack
+          type: wait
+          depends_on: [page-engineer]
+          config:
+            resume_on: webhook
+            timeout: 15m
+            on_timeout: continue
+
+      catch:
+        - id: log-alert-failure
+          type: notification
+          config:
+            channel: slack
+            url: "${{ secrets.slack_webhook }}"
+            payload:
+              text: "❌ Alert pipeline failed: ${{ error.message }}"
+              step: "${{ error.step_id }}"
+              alert: "${{ trigger.body.alert_title }}"
+
+      finally:
+        - id: audit-alert
+          type: database
+          config:
+            provider: postgres
+            credential_ref: db-credentials
+            operation: execute
+            query: |
+              INSERT INTO audit_log (event_type, event_data, created_at)
+              VALUES ('monitoring_alert_processed', $1::jsonb, NOW())
+            params:
+              - |
+                {
+                  "alert": "${{ trigger.body.alert_title }}",
+                  "service": "${{ trigger.body.service }}",
+                  "success": ${{ error == null }},
+                  "workflow_run": "${{ workflow.run_id }}"
+                }
+
+# ─── Global Error Handler ───────────────────────────────────────────
+on_error:
+  strategy: fail_fast
+  handler:
+    steps:
+      - id: global-error-log
+        type: notification
+        config:
+          channel: slack
+          url: "${{ secrets.slack_webhook }}"
+          payload:
+            text: "Support triage workflow failed"
+            workflow: "${{ workflow.name }}"
+            run_id: "${{ workflow.run_id }}"
+            error: "${{ error.message }}"
+            ticket_id: "${{ variables.ticket_id }}"

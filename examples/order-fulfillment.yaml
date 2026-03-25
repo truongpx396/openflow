@@ -1,0 +1,517 @@
+# yaml-language-server: $schema=../schemas/openflow-v1.0.0.schema.json
+# =============================================================================
+# E-Commerce Order Fulfillment Workflow
+# =============================================================================
+# OpenFlow YAML DSL v1.0.0 — Example Workflow
+#
+# This workflow demonstrates an end-to-end order processing pipeline:
+#   1. Receives an order via webhook, enriches it in parallel
+#   2. Validates the order against business rules (gate chain)
+#   3. On success: reserves inventory, queues shipment, responds OK
+#   4. On failure: notifies ops team + responds with error details
+#   5. Nightly scheduled reconciliation of stale orders
+#
+# Step types showcased:
+#   parallel, for_each, branch, gate_chain, script,
+#   http, storage, queue, notification, respond
+# =============================================================================
+
+openflow: "1.0.0"
+
+metadata:
+  name: order-fulfillment
+  version: "1.0.0"
+  description: >
+    Order fulfillment pipeline for an e-commerce platform.
+    Receives orders, enriches with catalog/customer data,
+    validates against business rules, and dispatches for shipment.
+  labels:
+    team: order-platform
+    domain: e-commerce
+  annotations:
+    owner: fulfillment-team
+    sla: "30s"
+
+# ---------------------------------------------------------------------------
+# TRIGGERS
+# ---------------------------------------------------------------------------
+triggers:
+  - type: webhook
+    id: order-received
+    config:
+      method: POST
+      path: /api/orders/process
+      response_mode: deferred
+      description: >
+        Accepts JSON order payload with line items,
+        customer info, and shipping address.
+
+  - type: schedule
+    id: daily-reconciliation
+    config:
+      cron: "0 3 * * *"
+      timezone: UTC
+      description: >
+        Nightly job to reconcile pending orders older than 24 hours.
+
+# ---------------------------------------------------------------------------
+# VARIABLES
+# ---------------------------------------------------------------------------
+variables:
+  order_id: "${{ trigger.body.order_id }}"
+  region: "${{ trigger.body.shipping_address.country_code }}"
+  currency: "${{ trigger.body.currency || 'USD' }}"
+  notification_channels:
+    - "ops-alerts@example.com"
+    - "fulfillment-slack-channel"
+
+# ---------------------------------------------------------------------------
+# SECRETS
+# ---------------------------------------------------------------------------
+secrets:
+  - id: cloud-credentials
+    provider: env
+    key: CLOUD_CREDENTIALS
+  - id: shipping-api-key
+    provider: env
+    key: SHIPPING_PROVIDER_API_KEY
+
+# ---------------------------------------------------------------------------
+# STEPS — Order Processing Pipeline (trigger: order-received)
+# ---------------------------------------------------------------------------
+steps:
+  # =========================================================================
+  # PHASE 1: Data Enrichment (parallel fan-out)
+  # =========================================================================
+
+  - id: enrich-order
+    name: "Enrich order with catalog and customer data"
+    type: parallel
+    trigger_ref: order-received
+    config:
+      branches:
+        - steps:
+            - id: fetch-product-details
+              type: http
+              config:
+                method: POST
+                url: "${{ env.CATALOG_SERVICE_URL }}/products/batch"
+                body:
+                  skus: "${{ trigger.body.line_items.map(i => i.sku) }}"
+              retry:
+                max_attempts: 2
+                delay: 1s
+                backoff: exponential
+        - steps:
+            - id: fetch-customer-profile
+              type: http
+              config:
+                method: GET
+                url: "${{ env.CUSTOMER_SERVICE_URL }}/customers/${{ trigger.body.customer_id }}"
+              retry:
+                max_attempts: 2
+                delay: 1s
+                backoff: fixed
+      join: all
+      output_merge: combine
+
+  # =========================================================================
+  # PHASE 2: Transform & Validate
+  # =========================================================================
+
+  - id: merge-order-data
+    name: "Merge order with enriched product and customer data"
+    type: script
+    depends_on: [enrich-order]
+    config:
+      language: javascript
+      code: |
+        const order = trigger.body;
+        const products = steps['fetch-product-details'].output;
+        const customer = steps['fetch-customer-profile'].output;
+
+        const enrichedItems = order.line_items.map(item => {
+          const product = products.find(p => p.sku === item.sku) || {};
+          return {
+            sku: item.sku,
+            name: product.name || item.sku,
+            quantity: item.quantity,
+            unit_price: product.price || item.unit_price,
+            weight_kg: product.weight_kg || 0,
+            in_stock: product.available_quantity >= item.quantity,
+            available_quantity: product.available_quantity || 0
+          };
+        });
+
+        const subtotal = enrichedItems.reduce(
+          (sum, i) => sum + (i.unit_price * i.quantity), 0
+        );
+
+        return {
+          order_id: order.order_id,
+          customer: {
+            id: customer.id,
+            name: customer.name,
+            email: customer.email,
+            tier: customer.loyalty_tier || 'standard',
+            account_age_days: customer.account_age_days || 0,
+            is_verified: customer.is_verified || false
+          },
+          items: enrichedItems,
+          shipping_address: order.shipping_address,
+          subtotal: subtotal,
+          discount: order.discount || 0,
+          total: subtotal - (order.discount || 0),
+          currency: variables.currency,
+          region: variables.region
+        };
+
+  - id: check-items-exist
+    name: "Ensure the order has at least one line item"
+    type: branch
+    depends_on: [merge-order-data]
+    config:
+      conditions:
+        - id: has-items
+          when: "${{ len(steps.merge-order-data.output.items) > 0 }}"
+          then: run-validations
+        - id: empty-order
+          when: true
+          then: handle-validation-error
+
+  # =========================================================================
+  # PHASE 3: Validation — Business Rules (Gate Chain)
+  # =========================================================================
+  #
+  # Each rule showcases a different validation pattern:
+  #   1. Array filter + existence check  (stock availability)
+  #   2. Numeric range check             (order total limits)
+  #   3. Conditional logic               (customer verification)
+  #   4. Required-fields completeness    (shipping address)
+  #   5. Set membership / allow-list     (shipping region)
+
+  - id: run-validations
+    name: "Validate order against business rules"
+    type: gate_chain
+    depends_on: [merge-order-data]
+    config:
+      input_ref: merge-order-data
+      gates:
+        # ----- Rule 1: All items in stock -----
+        - id: rule-stock-check
+          name: "Stock Availability"
+          description: "Every line item must have sufficient inventory"
+          step:
+            type: script
+            config:
+              language: javascript
+              code: |
+                const outOfStock = input.items.filter(i => !i.in_stock);
+                const passed = outOfStock.length === 0;
+                return {
+                  rule: 'Stock Availability',
+                  passed,
+                  reason: passed
+                    ? 'All items in stock'
+                    : `Out of stock: [${outOfStock.map(i =>
+                        `${i.sku} (need ${i.quantity}, have ${i.available_quantity})`
+                      ).join(', ')}]`
+                };
+          pass_condition: "${{ output.passed == true }}"
+
+        # ----- Rule 2: Order total within limits -----
+        - id: rule-order-limits
+          name: "Order Total Limits"
+          description: "Order total must be between $1 and $50,000"
+          step:
+            type: script
+            config:
+              language: javascript
+              code: |
+                const total = input.total;
+                const min = 1, max = 50000;
+                const passed = total >= min && total <= max;
+                return {
+                  rule: 'Order Total Limits',
+                  passed,
+                  order_total: total,
+                  reason: passed
+                    ? `Total $${total.toFixed(2)} within limits`
+                    : `Total $${total.toFixed(2)} outside range [$${min}–$${max}]`
+                };
+          pass_condition: "${{ output.passed == true }}"
+
+        # ----- Rule 3: Customer account verified -----
+        - id: rule-customer-verified
+          name: "Customer Verification"
+          description: "Customer must be verified, or order must be under $500"
+          step:
+            type: script
+            config:
+              language: javascript
+              code: |
+                const verified = input.customer.is_verified;
+                const total = input.total;
+                const threshold = 500;
+                const passed = verified || total < threshold;
+                return {
+                  rule: 'Customer Verification',
+                  passed,
+                  customer_verified: verified,
+                  order_total: total,
+                  reason: passed
+                    ? verified
+                      ? 'Customer is verified'
+                      : `Unverified but total $${total.toFixed(2)} < $${threshold}`
+                    : `Unverified customer with order $${total.toFixed(2)} >= $${threshold}`
+                };
+          pass_condition: "${{ output.passed == true }}"
+
+        # ----- Rule 4: Shipping address completeness -----
+        - id: rule-shipping-address
+          name: "Shipping Address Complete"
+          description: "All required address fields must be present"
+          step:
+            type: script
+            config:
+              language: javascript
+              code: |
+                const addr = input.shipping_address || {};
+                const required = ['street', 'city', 'postal_code', 'country_code'];
+                const missing = required.filter(f => !addr[f] || addr[f].trim() === '');
+                const passed = missing.length === 0;
+                return {
+                  rule: 'Shipping Address Complete',
+                  passed,
+                  reason: passed
+                    ? 'All address fields present'
+                    : `Missing fields: [${missing.join(', ')}]`
+                };
+          pass_condition: "${{ output.passed == true }}"
+
+        # ----- Rule 5: Supported shipping region -----
+        - id: rule-shipping-region
+          name: "Supported Shipping Region"
+          description: "Country must be in the supported shipping list"
+          step:
+            type: script
+            config:
+              language: javascript
+              code: |
+                const supported = ['US','CA','GB','DE','FR','JP','AU','SG'];
+                const country = (input.shipping_address?.country_code || '').toUpperCase();
+                const passed = supported.includes(country);
+                return {
+                  rule: 'Supported Shipping Region',
+                  passed,
+                  country_code: country,
+                  reason: passed
+                    ? `Region "${country}" is supported`
+                    : `Region "${country}" not in [${supported.join(', ')}]`
+                };
+          pass_condition: "${{ output.passed == true }}"
+
+      on_all_passed: handle-success
+      on_gate_failed: handle-validation-error
+      collect_failures: true
+
+  # =========================================================================
+  # PHASE 4A: Success — Reserve Inventory & Queue Shipment
+  # =========================================================================
+
+  - id: handle-success
+    name: "Prepare fulfillment payload"
+    type: script
+    config:
+      language: javascript
+      code: |
+        const data = input;
+        return {
+          success: true,
+          order_id: data.order_id,
+          customer_name: data.customer.name,
+          total: parseFloat(data.total).toFixed(2),
+          currency: data.currency,
+          items: data.items.map(i => ({
+            sku: i.sku, name: i.name,
+            quantity: i.quantity, unit_price: i.unit_price
+          })),
+          shipping: data.shipping_address,
+          message: {
+            order_id: data.order_id,
+            action: 'FULFILL',
+            priority: data.customer.tier === 'premium' ? 'high' : 'normal',
+            total_weight_kg: data.items.reduce(
+              (sum, i) => sum + (i.weight_kg * i.quantity), 0
+            )
+          }
+        };
+
+  - id: save-order-receipt
+    name: "Save order receipt to cloud storage"
+    type: storage
+    depends_on: [handle-success]
+    config:
+      provider: s3
+      credential_ref: cloud-credentials
+      operation: upload
+      bucket: "order-receipts"
+      key: "orders/${{ variables.order_id }}/receipt.json"
+      source: "${{ steps.handle-success.output }}"
+
+  - id: reserve-inventory
+    name: "Reserve inventory for each line item"
+    type: for_each
+    depends_on: [handle-success]
+    config:
+      items: "${{ steps.handle-success.output.items }}"
+      iterator_var: item
+      batch_size: 5
+      concurrency: 5
+      steps:
+        - id: reserve-item
+          type: http
+          config:
+            method: POST
+            url: "${{ env.INVENTORY_SERVICE_URL }}/reserve"
+            body:
+              order_id: "${{ variables.order_id }}"
+              sku: "${{ item.sku }}"
+              quantity: "${{ item.quantity }}"
+          retry:
+            max_attempts: 3
+            delay: 1s
+            backoff: exponential
+      output:
+        aggregate: true
+        field: reservations
+
+  - id: respond-success
+    name: "Send success response"
+    type: respond
+    depends_on: [handle-success]
+    config:
+      status_code: 200
+      body: "${{ steps.handle-success.output }}"
+
+  - id: queue-shipment
+    name: "Queue order for shipment processing"
+    type: queue
+    depends_on: [reserve-inventory]
+    config:
+      provider: aws-sqs
+      credential_ref: cloud-credentials
+      operation: send
+      queue_url: "${{ env.SHIPMENT_QUEUE_URL }}"
+      message: "${{ steps.handle-success.output.message }}"
+
+  # =========================================================================
+  # PHASE 4B: Validation Error — Notify & Respond
+  # =========================================================================
+
+  - id: handle-validation-error
+    name: "Prepare error response"
+    type: script
+    config:
+      language: javascript
+      code: |
+        const data = input;
+        const failedGate = data.failed_gate || {};
+        return {
+          success: false,
+          order_id: data.order_id,
+          failed_rule: failedGate.rule || 'unknown',
+          failed_reason: failedGate.reason || '',
+          message: `Order ${data.order_id} rejected — ${failedGate.rule}: ${failedGate.reason}`,
+          validation_results: data.gate_results || {}
+        };
+
+  - id: respond-error
+    name: "Send error response"
+    type: respond
+    depends_on: [handle-validation-error]
+    config:
+      status_code: 422
+      body: "${{ steps.handle-validation-error.output }}"
+
+  - id: send-error-notification
+    name: "Notify ops team of rejected order"
+    type: notification
+    depends_on: [handle-validation-error]
+    config:
+      channel: webhook
+      url: "${{ env.OPS_WEBHOOK_URL }}"
+      method: POST
+      payload:
+        alert: "order_rejected"
+        to: "${{ variables.notification_channels }}"
+        order_id: "${{ steps.handle-validation-error.output.order_id }}"
+        reason: "${{ steps.handle-validation-error.output.message }}"
+
+  # =========================================================================
+  # PHASE 5: Nightly Reconciliation (trigger: daily-reconciliation)
+  # =========================================================================
+
+  - id: reconcile-pending-orders
+    name: "Fetch stale pending orders"
+    type: http
+    trigger_ref: daily-reconciliation
+    config:
+      method: GET
+      url: "${{ env.ORDER_SERVICE_URL }}/orders?status=pending&older_than=24h"
+    retry:
+      max_attempts: 2
+      delay: 5s
+      backoff: fixed
+
+  - id: process-stale-orders
+    name: "Cancel or escalate stale orders"
+    type: for_each
+    depends_on: [reconcile-pending-orders]
+    config:
+      items: "${{ steps.reconcile-pending-orders.output.orders }}"
+      iterator_var: stale_order
+      batch_size: 10
+      steps:
+        - id: cancel-stale-order
+          type: http
+          config:
+            method: POST
+            url: "${{ env.ORDER_SERVICE_URL }}/orders/${{ stale_order.id }}/cancel"
+            body:
+              reason: "Auto-cancelled: pending > 24h without fulfillment"
+          on_error:
+            strategy: continue
+      output:
+        aggregate: true
+        field: cancelled_orders
+
+  - id: notify-reconciliation-summary
+    name: "Send reconciliation summary"
+    type: notification
+    depends_on: [process-stale-orders]
+    config:
+      channel: webhook
+      url: "${{ env.OPS_WEBHOOK_URL }}"
+      method: POST
+      payload:
+        alert: "daily_reconciliation"
+        cancelled_count: "${{ len(steps.process-stale-orders.output.cancelled_orders) }}"
+        timestamp: "${{ now() }}"
+
+# ---------------------------------------------------------------------------
+# GLOBAL ERROR HANDLER
+# ---------------------------------------------------------------------------
+on_error:
+  strategy: fail_fast
+  handler:
+    steps:
+      - id: global-error-respond
+        type: respond
+        config:
+          status_code: 500
+          body:
+            success: false
+            error: "${{ error.message }}"
+            workflow: "${{ workflow.name }}"
+            run_id: "${{ workflow.run_id }}"
