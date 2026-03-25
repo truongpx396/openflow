@@ -243,12 +243,13 @@ This enables:
 
 ## Roadmap
 
-- [x] ~~**v1.0.0**: `approval`, `wait`, `database`, `ai` step types; `try/catch/finally`; `cache`, `rate_limit`, `log` step properties; `manual` trigger with `input_schema`~~ ✅
-- [ ] **v1.2.0**: Add `temporal_activity` step type for durable execution
-- [ ] **Runtime SDK**: Python/TypeScript reference implementation
-- [ ] **CLI Tool**: `openflow validate`, `openflow run`, `openflow visualize`
-- [ ] **VS Code Extension**: Visual editor for OpenFlow YAML files
-- [ ] **Converter**: Import from Airflow DAG / GitHub Actions / other workflow formats
+- [x] ~~**v1.0.0 (Spec)**: Core spec with 21 step types, 5 trigger types, 8 flow control patterns, step policies (`cache`, `rate_limit`, `log`), `try`/`catch`/`finally`, `approval`, `wait`, `database`, `ai`, `manual` trigger with `input_schema`~~ ✅
+- [ ] **CLI Tool**: `openflow validate` (schema validation), `openflow lint` (best practices), `openflow visualize` (DAG rendering)
+- [ ] **Conformance Test Suite**: YAML test cases for runtime compliance verification
+- [ ] **Runtime SDK**: Python & TypeScript reference implementation
+- [ ] **v1.1.0 (Spec)**: Extension registry protocol, schema migration & versioning strategy
+- [ ] **VS Code Extension**: Visual DAG editor, step palette, live validation
+- [ ] **Converter**: Import from Airflow DAG / GitHub Actions / Argo / Other Workflows
 
 ## Contributing
 
